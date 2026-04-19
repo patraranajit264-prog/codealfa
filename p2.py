@@ -1,0 +1,137 @@
+import streamlit as st
+import os
+import numpy as np
+from music21 import converter, instrument, note, chord, stream
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, Dropout, LSTM
+from tensorflow.keras.utils import to_categorical
+st.set_page_config(page_title="AI Music Generator")
+st.title("🎵 AI Music Generator (Error-Free Version)")
+def extract_notes(folder):
+    notes = []
+    for file in os.listdir(folder):
+        if file.endswith(".mid"):
+            midi = converter.parse(os.path.join(folder, file))
+            parts = instrument.partitionByInstrument(midi)
+            if parts:
+                notes_to_parse = parts.parts[0].recurse()
+            else:
+                notes_to_parse = midi.flat.notes
+
+            for element in notes_to_parse:
+                if isinstance(element, note.Note):
+                    notes.append(str(element.pitch))
+                elif isinstance(element, chord.Chord):
+                    notes.append('.'.join(str(n) for n in element.normalOrder))
+    return notes
+def prepare_sequences(notes, seq_len=50):
+    pitchnames = sorted(set(notes))
+    note_to_int = {n: i for i, n in enumerate(pitchnames)}
+
+    network_input = []
+    network_output = []
+
+    for i in range(len(notes) - seq_len):
+        seq_in = notes[i:i + seq_len]
+        seq_out = notes[i + seq_len]
+
+        network_input.append([note_to_int[n] for n in seq_in])
+        network_output.append(note_to_int[seq_out])
+
+    network_input = np.reshape(network_input, (len(network_input), seq_len, 1))
+    network_input = network_input / float(len(pitchnames))
+
+    network_output = to_categorical(network_output)
+
+    return network_input, network_output, note_to_int, pitchnames
+
+def create_model(input_shape, n_vocab):
+    model = Sequential()
+    model.add(LSTM(128, input_shape=input_shape, return_sequences=True))
+    model.add(Dropout(0.2))
+    model.add(LSTM(128))
+    model.add(Dense(128, activation='relu'))
+    model.add(Dense(n_vocab, activation='softmax'))
+
+    model.compile(loss='categorical_crossentropy', optimizer='adam')
+    return model
+
+st.subheader("📂 Upload MIDI Files")
+files = st.file_uploader("Upload .mid files", type=["mid"], accept_multiple_files=True)
+
+if files:
+    os.makedirs("dataset", exist_ok=True)
+    for file in files:
+        with open(os.path.join("dataset", file.name), "wb") as f:
+            f.write(file.getbuffer())
+    st.success("✅ Files uploaded")
+
+if st.button("🚀 Train Model"):
+    if not os.path.exists("dataset"):
+        st.error("Upload MIDI files first!")
+    else:
+        with st.spinner("Training... please wait"):
+            notes = extract_notes("dataset")
+
+            if len(notes) < 100:
+                st.error("Not enough data! Upload more MIDI files.")
+            else:
+                X, y, note_to_int, pitchnames = prepare_sequences(notes)
+
+                model = create_model((X.shape[1], X.shape[2]), len(pitchnames))
+                model.fit(X, y, epochs=10, batch_size=32)
+
+                model.save("model.h5")
+
+        st.success("✅ Model Trained!")
+
+if st.button("🎶 Generate Music"):
+    if not os.path.exists("model.h5"):
+        st.error("Train model first!")
+    else:
+        notes = extract_notes("dataset")
+        X, _, note_to_int, pitchnames = prepare_sequences(notes)
+
+        int_to_note = {i: n for n, i in note_to_int.items()}
+        model = load_model("model.h5")
+
+        start = np.random.randint(0, len(X)-1)
+        pattern = X[start]
+
+        output = []
+
+        for i in range(100):
+            inp = np.reshape(pattern, (1, len(pattern), 1))
+            pred = model.predict(inp, verbose=0)
+
+            index = np.argmax(pred)
+            result = int_to_note[index]
+            output.append(result)
+
+            pattern = np.append(pattern, index/float(len(pitchnames)))
+            pattern = pattern[1:]
+        offset = 0
+        notes_out = []
+
+        for p in output:
+            if '.' in p:
+                chord_notes = [note.Note(int(n)) for n in p.split('.')]
+                for n in chord_notes:
+                    n.offset = offset
+                notes_out.append(chord.Chord(chord_notes))
+            else:
+                new_note = note.Note(p)
+                new_note.offset = offset
+                notes_out.append(new_note)
+
+            offset += 0.5
+
+        midi_stream = stream.Stream(notes_out)
+        midi_stream.write('midi', fp='output.mid')
+
+        st.success("🎵 Music Generated!")
+
+        with open("output.mid", "rb") as f:
+            st.download_button("⬇ Download Music", f, file_name="output.mid")
+
+        st.info("👉 Play this file using VLC Media Player 🎧")
